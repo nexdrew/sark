@@ -1,0 +1,276 @@
+/*____ _  _ _  _ ____ ___ _ ____ _  _ ____ 
+  |___ |  | |\ | |     |  | |  | |\ | [__  
+  |    |__| | \| |___  |  | |__| | \| ___] 
+*/
+def funlist = { str ->
+        return str.split(",").findAll { "$it" }
+}
+
+def sanitize = { val ->
+        return val.replaceAll("[^a-zA-Z0-9]", "")
+}
+
+def addDeps = {
+	//-- declare project dependencies
+	project.dependencies {
+		funlist("$project.ext.wars").each {
+			app group: "$project.ext.grp", name: "$it", version: "$project.ext.ver", ext: "war"
+		}
+		funlist("$project.ext.zips").each {
+			zip group: "$project.ext.grp", name: "$it", version: "$project.ext.ver", classifier: "resources", ext: "zip"
+		}
+		funlist("$project.ext.sars").each {
+			app group: "$project.ext.grp", name: "$it", version: "$project.ext.ver", ext: "sar"
+		}
+	}
+}
+
+def setXcuFrom = {
+	//-- update xcopyunzip tasks with zip dependencies
+	def copyTasks = tasks.matching { task -> task.name.startsWith("xcopyunzip") }
+	copyTasks.each { task ->
+		def rzip = task.name - "xcopyunzip"
+		def m = configurations.zip.files { dep -> dep.name == rzip }
+		def a = m.toArray()
+		if(a.length > 0) {
+			def z = a[0] //assumes only one zip per name
+			task.configure {
+				from zipTree(z)
+			}
+		}
+	}
+}
+
+/*____ ____ _  _ ____ _ ____ 
+  |    |  | |\ | |___ | | __ 
+  |___ |__| | \| |    | |__] 
+*/
+repositories {
+	maven { url "http://ci.office.discretewireless.net:8081/artifactory/repo" }
+}
+
+configurations {
+	app
+	zip
+}
+
+configurations.all {
+	resolutionStrategy.cacheChangingModulesFor 0, "seconds"
+}
+
+/*___ ____ ____ _  _ ____
+   |  |__| [__  |_/  [__
+   |  |  | ___] | \_ ___] to force download of artifacts
+*/
+task a_downloadZips {
+	group = "Download"
+	description = "Force download static resources"
+	doLast {
+		configurations.zip.each { println "\tDownloaded zip: $it.name" }
+	}
+}
+
+task a_downloadApps {
+	group = "Download"
+	description = "Force download app artifacts"
+	doLast {
+		configurations.app.each { println "\tDownloaded app: $it.name" }
+	}
+}
+
+task a_download(dependsOn: [a_downloadApps, a_downloadZips]) {
+	group = "Download"
+	description = "Make sure all configured artifacts can be downloaded"
+}
+
+/*___ ____ ____ _  _ ____
+   |  |__| [__  |_/  [__
+   |  |  | ___] | \_ ___] to stop/start services
+*/
+funlist("$project.ext.svcs").each {
+	def svc = "$it"
+	tasks.add(name: "xstop${sanitize(svc)}", type: Exec) {
+		group = "Service mgt"
+		description = "Stop service $svc"
+		commandLine "sudo", "/sbin/service", "$svc", "stop"
+	}
+	tasks.add(name: "xstart${sanitize(svc)}", type: Exec) {
+		group = "Service mgt"
+		description = "Start service $svc"
+		commandLine "sudo", "/sbin/service", "$svc", "start"
+	}
+}
+
+task c_stopServices(dependsOn: tasks.matching { task -> task.name.startsWith("xstop") }) {
+	group = "Service mgt"
+	description = "Stop all services"
+}
+
+task e_startServices(dependsOn: tasks.matching { task -> task.name.startsWith("xstart") }) {
+	group = "Service mgt"
+	description = "Start all services"
+}
+
+task f_bounceServices(dependsOn: [c_stopServices, e_startServices]) {
+	group = "Service mgt"
+	description = "Stop and start all services"
+}
+
+/*___ ____ ____ _  _ ____
+   |  |__| [__  |_/  [__
+   |  |  | ___] | \_ ___] to deploy app artifacts (wars/sars)
+*/
+def DA_FILE = ".deployed_apps"
+
+task d_cleanApps(type: Delete) {
+	group = "App mgt"
+	def f = new File(DA_FILE)
+	description = "Delete apps from last deployment (per file '$f')"
+	def filesToDelete = []
+	if(f.exists()) {
+		def d
+		f.eachLine { line ->
+			filesToDelete += line
+			if(line.endsWith(".war")) {
+				d = new File(line - ".war")
+				if(d.exists() && d.isDirectory()) filesToDelete += d
+			}
+		}
+		filesToDelete += f
+	}
+	delete filesToDelete
+}
+
+def deployedAppsList = []
+
+funlist("$project.ext.deployDirs").each {
+	def dir = "$it"
+	tasks.add(name: "xupdate${sanitize(dir)}", type: Copy) {
+		group = "App mgt"
+		description = "Replace app artifacts in target directory $dir"
+		from configurations.app
+		into dir
+		rename { old ->
+			def neu = old - "-$project.ext.ver"
+			deployedAppsList += dir+"/$neu"
+			return neu
+		}
+	}
+}
+
+task d_replaceApps {
+	group = "App mgt"
+	description = "Replace app artifacts for all target directories"
+	dependsOn tasks.matching { task -> task.name.startsWith("xupdate") }
+	doLast {
+		new File(DA_FILE).withWriterAppend { writer ->
+			deployedAppsList.each { writer.println "$it" }
+		}
+		deployedAppsList = []
+	}
+}
+
+/*___ ____ ____ _  _ ____
+   |  |__| [__  |_/  [__
+   |  |  | ___] | \_ ___] to deploy static resources (zips)
+*/
+funlist("$project.ext.zips").each {
+	def rzip = "$it"
+	def rdir = project.ext["zips.$rzip"]
+	tasks.add(name: "xcleandir${sanitize(rdir)}", type: Delete) {
+		group = "Static resource mgt"
+		description = "Delete static resource directory $rdir"
+		delete rdir
+	}
+	tasks.add(name: "xcopyunzip$rzip", type: Copy) { t ->
+		group = "Static resource mgt"
+		description = "Unzip and copy static resources for $rzip to directory $rdir"
+		//-- note that the "from" config is set lazily by the b_resolveDynamicZipCopyTasks task
+		into rdir
+	}
+}
+
+task b_cleanResources(dependsOn: tasks.matching { task -> task.name.startsWith("xcleandir") }) {
+	group = "Static resource mgt"
+	description = "Deletes all static resource directories"
+}
+
+task b_resolveDynamicZipCopyTasks {
+	group = "Static resource mgt"
+	description = "Lazily resolve zip dependencies for dynamic tasks (this task is only useful if chained with other tasks)"
+	doLast {
+		setXcuFrom() //-- hack to only resolve zip dependencies when necessary
+	}
+}
+
+task b_replaceResources {
+	group = "Static resource mgt"
+	description = "Replaces all static resources"
+	dependsOn b_resolveDynamicZipCopyTasks //-- name must sort above xcopyunzip alphabetically
+	dependsOn tasks.matching { task -> task.name.startsWith("xcopyunzip") }
+}
+
+/*_  _ ____ ____ ___ ____ ____    ___ ____ ____ _  _ ____ 
+  |\/| |__| [__   |  |___ |__/     |  |__| [__  |_/  [__  
+  |  | |  | ___]  |  |___ |  \     |  |  | ___] | \_ ___] 
+*/
+task d_deployApps(dependsOn: [d_cleanApps, d_replaceApps]) {
+	group = "MASTER"
+	description = "Redeploy all apps to all target directories"
+}
+
+task f_bounceApps(dependsOn: [c_stopServices, d_deployApps, e_startServices]) {
+	group = "MASTER"
+	description = "Redeploy all apps and bounce all services"
+}
+
+task b_deployResources(dependsOn: [b_cleanResources, b_replaceResources]) {
+	group = "MASTER"
+	description = "Redeploy all static resources"
+}
+
+task deployAll(dependsOn: [a_download, b_deployResources, f_bounceApps]) {
+	group = "MASTER"
+	description = """==========================================================================================
+		Hello!
+
+		This is the main task.
+
+		The typical use-case is to call 'targetVersion<Version> deployAll' to:
+		- Update the target version to deploy (which is persisted in gradle.properties)
+		- Redeploy everything using the target version
+		- Bounce services
+
+		Everything specific to this host (including apps to deploy, deployment directories,
+		and services to bounce) is configured in gradle.properties. Give it a once-over.
+
+		Happy deploying!
+            =========================================================================================="""
+}
+
+/*___  ____ ___  ____ _  _ ___  ____ _  _ ____ _ ____ ____ 
+  |  \ |___ |__] |___ |\ | |  \ |___ |\ | |    | |___ [__  
+  |__/ |___ |    |___ | \| |__/ |___ | \| |___ | |___ ___] 
+
+  - Will be defined dynamically if "targetVersion" task used (typical use-case)
+  - Will be defined statically per gradle.properties otherwise
+*/
+def taskArgs = project.gradle.startParameter.taskNames.toString().toLowerCase()
+if(!taskArgs.contains("targetversion")) {
+        addDeps()
+}
+
+tasks.addRule("Pattern: targetVersion<Version> (e.g. targetVersion8.9.12-SNAPSHOT): Sets version to deploy the next time 'deployAll' is called") { taskName ->
+        if(taskName.startsWith("targetVersion")) {
+                task(taskName) << {
+                        def old = project.ext.ver
+                        project.ext.ver = taskName - "targetVersion"
+			ant.propertyfile(file: "gradle.properties") {
+				entry(key: "ver", value: project.ext.ver)
+			}
+                        println "\tproject.ext.ver changed from $old to $project.ext.ver"
+                        addDeps()
+                }
+        }
+}
+
